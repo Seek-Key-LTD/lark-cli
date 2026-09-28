@@ -1,0 +1,171 @@
+# 声明（gitea-actions-control-plane.md 公约 v0.1 的 GitHub 侧同款）
+# repository: Seek-Key-LTD/lark-cli（larksuite/cli 的 fork，公开）
+# purpose: 5 架构交叉编译（用户指定 4 种 + 我方 linux-arm64）+ Release 打标 pub-v<ver>
+# trigger: workflow_dispatch（upstream-track 触发或手动指定版本）+ schedule 每日 04:00 兜底
+# execution_class: 公开构建（GitHub 托管 runner，ubuntu-latest）
+# permissions: 本仓 contents:write（打 tag / 发 Release）；不使用任何自配 secrets
+# tac_action: push-to-main 即审批
+# data_residency: 产物发布在 GitHub Release（公开）；国内侧由 CT100 拉取入桶并同步至教育网 IHEP
+# rollback: 删除对应 Release 与 tag 即可；retirement: 上游原生支持 armv7 或需求消失时，删除本 workflow
+name: 📦 build（5 架构构建 → Release）
+
+on:
+  schedule:
+    - cron: '0 20 * * *'   # 每日 04:00（北京）兜底：upstream-track 未触发时仍会构建
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '指定上游 tag（留空 = 最新 release）'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: larksuite/cli
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      need_build: ${{ steps.check.outputs.need_build }}
+    steps:
+      - name: 🔎 拣选目标版本
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VER="$INPUT_VERSION"
+          else
+            VER=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "target: $VER"
+
+      - name: 🧮 已发布过吗（pub-$VER tag）
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.pick.outputs.version }}"
+          if gh api "repos/${{ github.repository }}/git/ref/tags/pub-${VER}" >/dev/null 2>&1; then
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+            echo "pub-${VER} 已存在，跳过"
+          else
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+            echo "pub-${VER} 不存在，进入构建"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # —— 用户指定的 4 种 ——
+          - goos: linux
+            goarch: amd64
+            artifact_name: lark-cli-linux-amd64
+          - goos: darwin
+            goarch: amd64
+            artifact_name: lark-cli-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            artifact_name: lark-cli-darwin-arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            artifact_name: lark-cli-linux-armv7
+          # —— 我方新增：linux-arm64（ash3/ch4/de 等 arm64 节点与 Ansible 剧本需要）——
+          - goos: linux
+            goarch: arm64
+            artifact_name: lark-cli-linux-arm64
+    steps:
+      - name: 📥 检出上游 ${{ needs.resolve.outputs.version }}
+        uses: actions/checkout@v4
+        with:
+          repository: larksuite/cli
+          ref: ${{ needs.resolve.outputs.version }}
+
+      - name: 🟢 Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # oapi-sdk-go 的 drive/v1 api_ext.go 用 math.MaxInt64 作为 int limit，
+      # 在 32 位 GOARCH=arm 上溢出。下载依赖后对 module cache 打 sed 补丁。
+      - name: 🔧 Patch 32-bit compat (arm only)
+        if: matrix.goarch == 'arm'
+        run: |
+          go mod download github.com/larksuite/oapi-sdk-go/v3
+          MODDIR=$(ls -d "$(go env GOMODCACHE)/github.com/larksuite/oapi-sdk-go"* 2>/dev/null | head -1)
+          echo "MODDIR=$MODDIR"
+          chmod -R u+w "$MODDIR"
+          for f in $(grep -rl 'math.MaxInt64' "$MODDIR" 2>/dev/null); do
+            sed -i 's/math\.MaxInt64/math.MaxInt32/g' "$f"
+            echo "patched: $f"
+          done
+
+      - name: 🔨 Build ${{ matrix.artifact_name }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUILD_DATE=$(date -u +"%Y-%m-%d")
+          go build -trimpath \
+            -ldflags="-s -w -X github.com/larksuite/cli/internal/build.Version=${VERSION} -X github.com/larksuite/cli/internal/build.Date=${BUILD_DATE}" \
+            -o ${{ matrix.artifact_name }} .
+
+      - name: 📤 上传临时 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          retention-days: 7
+
+  publish:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 汇集全部产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'lark-cli-*'
+          merge-multiple: true
+
+      - name: 🧾 生成 checksums.txt
+        run: |
+          set -euo pipefail
+          ls -la
+          sha256sum lark-cli-* > checksums.txt
+          cat checksums.txt
+
+      - name: "🏷️ 发布 Release（tag: pub-${{ needs.resolve.outputs.version }}）"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="pub-${VERSION}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "lark-cli ${VERSION}（linux/darwin × amd64/arm64/armv7）" \
+            --notes "从上游 ${UPSTREAM}@${VERSION} 源码构建（含 armv7 及其 32 位兼容补丁）。上游无 armv7 官方产物，本 Release 补齐国内侧所需架构。国内同步链从本 Release 拉取入桶。" \
+            lark-cli-* checksums.txt
