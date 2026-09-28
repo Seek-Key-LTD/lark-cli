@@ -163,6 +163,7 @@ jobs:
           set -euo pipefail
           TAG="pub-${VERSION}"
           gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "lark-cli ${VERSION}（linux/darwin × amd64/arm64/armv7）" \
             --notes "从上游 ${UPSTREAM}@${VERSION} 源码构建（含 armv7 及其 32 位兼容补丁）。上游无 armv7 官方产物，本 Release 补齐国内侧所需架构。国内同步链从本 Release 拉取入桶。" \
             lark-cli-* checksums.txt
